@@ -3,7 +3,7 @@ using System.IO;
 
 namespace Orleans.Runtime
 {
-    public class FileTelemetryConsumer : ITraceTelemetryConsumer
+    public class FileTelemetryConsumer : ITraceTelemetryConsumer, ICloseableTelemetryConsumer
     {
         private StreamWriter _logOutput;
         private readonly object _lockObj = new object();
@@ -42,6 +42,15 @@ namespace Orleans.Runtime
         public void TrackTrace(string message, Severity severity, IDictionary<string, string> properties)
         {
             TrackTrace(message, properties);
+        }
+
+        public void Close()
+        {
+            lock (_lockObj)
+            {
+                _logOutput.Close();
+                _logOutput = null;
+            }
         }
     }
 }

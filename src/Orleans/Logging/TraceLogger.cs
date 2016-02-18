@@ -995,6 +995,14 @@ namespace Orleans.Runtime
                     }
                     catch (Exception) { }
                 }
+                foreach (ICloseableTelemetryConsumer consumer in TelemetryConsumers.OfType<ICloseableTelemetryConsumer>())
+                {
+                    try
+                    {
+                        consumer.Close();
+                    }
+                    catch (Exception) { }
+                }
             }
             catch (Exception) { }
         }
