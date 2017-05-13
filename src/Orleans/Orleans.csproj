@@ -140,7 +140,6 @@
     <Compile Include="Telemetry\Consumers\ConsoleTelemetryConsumer.cs" />
     <Compile Include="Telemetry\Consumers\FileTelemetryConsumer.cs" />
     <Compile Include="Telemetry\Consumers\TraceTelemetryConsumer.cs" />
-    <Compile Include="Telemetry\ICloseableTelemetryConsumer.cs" />
     <Compile Include="Telemetry\IDependencyTelemetryConsumer.cs" />
     <Compile Include="Telemetry\IEventTelemetryConsumer.cs" />
     <Compile Include="Telemetry\IExceptionTelemetryConsumer.cs" />
