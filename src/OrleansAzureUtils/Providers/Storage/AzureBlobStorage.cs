@@ -1,16 +1,16 @@
 ﻿using System;
-using System.Runtime.Serialization.Formatters;
+using System.Collections.Generic;
 using System.Text;
 using System.Threading.Tasks;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Blob;
-using Microsoft.WindowsAzure.Storage.Blob.Protocol;
 using Newtonsoft.Json;
 using Orleans.Providers;
 using Orleans.Providers.Azure;
 using Orleans.Runtime;
-using System.Collections.Generic;
 using Orleans.Runtime.Configuration;
+using Orleans.Serialization;
 
 namespace Orleans.Storage
 {
@@ -44,7 +44,11 @@ namespace Orleans.Storage
     /// </example>
     public class AzureBlobStorage : IStorageProvider
     {
-        private JsonSerializerSettings settings;
+        internal const string DataConnectionStringPropertyName = AzureTableStorage.DataConnectionStringPropertyName;
+        internal const string ContainerNamePropertyName = "ContainerName";
+        internal const string ContainerNameDefaultValue = "grainstate";
+
+        private JsonSerializerSettings jsonSettings;
 
         private CloudBlobContainer container;
 
@@ -65,13 +69,14 @@ namespace Orleans.Storage
             try
             {
                 this.Name = name;
-                ConfigureJsonSerializerSettings(config);
+                var serializationManager = providerRuntime.ServiceProvider.GetRequiredService<SerializationManager>();
+                this.jsonSettings = OrleansJsonSerializer.UpdateSerializerSettings(OrleansJsonSerializer.GetDefaultSerializerSettings(serializationManager, providerRuntime.GrainFactory), config);
 
-                if (!config.Properties.ContainsKey("DataConnectionString")) throw new BadProviderConfigException("The DataConnectionString setting has not been configured in the cloud role. Please add a DataConnectionString setting with a valid Azure Storage connection string.");
+                if (!config.Properties.ContainsKey(DataConnectionStringPropertyName)) throw new BadProviderConfigException($"The {DataConnectionStringPropertyName} setting has not been configured in the cloud role. Please add a {DataConnectionStringPropertyName} setting with a valid Azure Storage connection string.");
 
-                var account = CloudStorageAccount.Parse(config.Properties["DataConnectionString"]);
+                var account = CloudStorageAccount.Parse(config.Properties[DataConnectionStringPropertyName]);
                 var blobClient = account.CreateCloudBlobClient();
-                var containerName = config.Properties.ContainsKey("ContainerName") ? config.Properties["ContainerName"] : "grainstate";
+                var containerName = config.Properties.ContainsKey(ContainerNamePropertyName) ? config.Properties[ContainerNamePropertyName] : ContainerNameDefaultValue;
                 container = blobClient.GetContainerReference(containerName);
                 await container.CreateIfNotExistsAsync().ConfigureAwait(false);
 
@@ -87,66 +92,18 @@ namespace Orleans.Storage
 
         IEnumerable<string> FormatPropertyMessage(IProviderConfiguration config)
         {
-            foreach (var property in new string[] { "ContainerName", "SerializeTypeNames", "PreserveReferencesHandling", "UseFullAssemblyNames", "IndentJSON" })
+            var properties = new[]
+            {
+                ContainerNamePropertyName,
+                "SerializeTypeNames",
+                "PreserveReferencesHandling",
+                OrleansJsonSerializer.UseFullAssemblyNamesProperty,
+                OrleansJsonSerializer.IndentJsonProperty
+            };
+            foreach (var property in properties)
             {
                 if (!config.Properties.ContainsKey(property)) continue;
                 yield return string.Format("{0}={1}", property, config.Properties[property]);
-            }
-        }
-
-
-        private void ConfigureJsonSerializerSettings(IProviderConfiguration config)
-        {
-            // By default, use automatic type name handling, simple assembly names, and no JSON formatting
-            settings = new JsonSerializerSettings
-            {
-                TypeNameHandling = TypeNameHandling.Auto,
-                TypeNameAssemblyFormat = FormatterAssemblyStyle.Simple,
-                Formatting = Formatting.None
-            };
-
-            if (config.Properties.ContainsKey("SerializeTypeNames"))
-            {
-                bool serializeTypeNames = false;
-                var serializeTypeNamesValue = config.Properties["SerializeTypeNames"];
-                bool.TryParse(serializeTypeNamesValue, out serializeTypeNames);
-                if (serializeTypeNames)
-                {
-                    settings.TypeNameHandling = TypeNameHandling.All;
-                }
-            }
-
-            if (config.Properties.ContainsKey("PreserveReferencesHandling"))
-            {
-                bool preserveReferencesHandling;
-                var preserveReferencesHandlingValue = config.Properties["PreserveReferencesHandling"];
-                bool.TryParse(preserveReferencesHandlingValue, out preserveReferencesHandling);
-                if (preserveReferencesHandling)
-                {
-                    settings.PreserveReferencesHandling = PreserveReferencesHandling.Objects;
-                }
-            }
-
-            if (config.Properties.ContainsKey("UseFullAssemblyNames"))
-            {
-                bool useFullAssemblyNames = false;
-                var UseFullAssemblyNamesValue = config.Properties["UseFullAssemblyNames"];
-                bool.TryParse(UseFullAssemblyNamesValue, out useFullAssemblyNames);
-                if (useFullAssemblyNames)
-                {
-                    settings.TypeNameAssemblyFormat = FormatterAssemblyStyle.Full;
-                }
-            }
-
-            if (config.Properties.ContainsKey("IndentJSON"))
-            {
-                bool indentJSON = false;
-                var indentJSONValue = config.Properties["IndentJSON"];
-                bool.TryParse(indentJSONValue, out indentJSON);
-                if (indentJSON)
-                {
-                    settings.Formatting = Formatting.Indented;
-                }
             }
         }
 
@@ -154,7 +111,7 @@ namespace Orleans.Storage
         /// <see cref="IProvider.Close"/>
         public Task Close()
         {
-            return TaskDone.Done;
+            return Task.CompletedTask;
         }
 
         /// <summary> Read state data function for this storage provider. </summary>
@@ -174,21 +131,15 @@ namespace Orleans.Storage
                 {
                     json = await blob.DownloadTextAsync().ConfigureAwait(false);
                 }
-                catch (StorageException exception)
+                catch (StorageException exception) when (exception.IsBlobNotFound())
                 {
-                    var errorCode = exception.RequestInformation.ExtendedErrorInformation.ErrorCode;
-                    if (errorCode == BlobErrorCodeStrings.BlobNotFound)
-                    {
-                        if (this.Log.IsVerbose2) this.Log.Verbose2((int)AzureProviderErrorCode.AzureBlobProvider_BlobNotFound, "BlobNotFound reading: GrainType={0} Grainid={1} ETag={2} from BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
-                        return;
-                    }
-                    if (errorCode == BlobErrorCodeStrings.ContainerNotFound)
-                    {
-                        if (this.Log.IsVerbose2) this.Log.Verbose2((int)AzureProviderErrorCode.AzureBlobProvider_ContainerNotFound, "ContainerNotFound reading: GrainType={0} Grainid={1} ETag={2} from BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
-                        return;
-                    }
-
-                    throw;
+                    if (this.Log.IsVerbose2) this.Log.Verbose2((int)AzureProviderErrorCode.AzureBlobProvider_BlobNotFound, "BlobNotFound reading: GrainType={0} Grainid={1} ETag={2} from BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
+                    return;
+                }
+                catch (StorageException exception) when (exception.IsContainerNotFound())
+                {
+                    if (this.Log.IsVerbose2) this.Log.Verbose2((int)AzureProviderErrorCode.AzureBlobProvider_ContainerNotFound, "ContainerNotFound reading: GrainType={0} Grainid={1} ETag={2} from BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
+                    return;
                 }
 
                 if (string.IsNullOrWhiteSpace(json))
@@ -197,7 +148,7 @@ namespace Orleans.Storage
                     return;
                 }
 
-                grainState.State = JsonConvert.DeserializeObject(json, grainState.State.GetType(), settings);
+                grainState.State = JsonConvert.DeserializeObject(json, grainState.State.GetType(), jsonSettings);
                 grainState.ETag = blob.Properties.ETag;
 
                 if (this.Log.IsVerbose3) this.Log.Verbose3((int)AzureProviderErrorCode.AzureBlobProvider_Storage_DataRead, "Read: GrainType={0} Grainid={1} ETag={2} from BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
@@ -207,6 +158,8 @@ namespace Orleans.Storage
                 Log.Error((int)AzureProviderErrorCode.AzureBlobProvider_ReadError,
                     string.Format("Error reading: GrainType={0} Grainid={1} ETag={2} from BlobName={3} in Container={4} Exception={5}", grainType, grainId, grainState.ETag, blobName, container.Name, ex.Message),
                     ex);
+
+                throw;
             }
         }
 
@@ -224,41 +177,12 @@ namespace Orleans.Storage
             {
                 if (this.Log.IsVerbose3) this.Log.Verbose3((int)AzureProviderErrorCode.AzureBlobProvider_Storage_Writing, "Writing: GrainType={0} Grainid={1} ETag={2} to BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
 
-                var json = JsonConvert.SerializeObject(grainState.State, settings);
+                var json = JsonConvert.SerializeObject(grainState.State, jsonSettings);
 
                 var blob = container.GetBlockBlobReference(blobName);
                 blob.Properties.ContentType = "application/json";
 
-                var containerNotFound = false;
-                try
-                {
-                    await blob.UploadTextAsync(
-                            json,
-                            Encoding.UTF8,
-                            AccessCondition.GenerateIfMatchCondition(grainState.ETag),
-                            null,
-                            null).ConfigureAwait(false);
-                }
-                catch (StorageException exception)
-                {
-                    var errorCode = exception.RequestInformation.ExtendedErrorInformation.ErrorCode;
-                    containerNotFound = errorCode == BlobErrorCodeStrings.ContainerNotFound;
-                }
-                if (containerNotFound)
-                {
-                    // if the container does not exist, create it, and make another attempt
-                    if (this.Log.IsVerbose3) this.Log.Verbose3((int)AzureProviderErrorCode.AzureBlobProvider_ContainerNotFound, "Creating container: GrainType={0} Grainid={1} ETag={2} to BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
-                    await container.CreateIfNotExistsAsync().ConfigureAwait(false);
-
-                    await blob.UploadTextAsync(
-                        json,
-                        Encoding.UTF8,
-                        AccessCondition.GenerateIfMatchCondition(grainState.ETag),
-                        null,
-                        null).ConfigureAwait(false);
-                }
-
-                grainState.ETag = blob.Properties.ETag;
+                await WriteStateAndCreateContainerIfNotExists(grainType, grainId, grainState, json, blob);
 
                 if (this.Log.IsVerbose3) this.Log.Verbose3((int)AzureProviderErrorCode.AzureBlobProvider_Storage_DataRead, "Written: GrainType={0} Grainid={1} ETag={2} to BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
             }
@@ -267,6 +191,8 @@ namespace Orleans.Storage
                 Log.Error((int)AzureProviderErrorCode.AzureBlobProvider_WriteError,
                     string.Format("Error writing: GrainType={0} Grainid={1} ETag={2} to BlobName={3} in Container={4} Exception={5}", grainType, grainId, grainState.ETag, blobName, container.Name, ex.Message),
                     ex);
+
+                throw;
             }
         }
 
@@ -280,20 +206,52 @@ namespace Orleans.Storage
                 if (this.Log.IsVerbose3) this.Log.Verbose3((int)AzureProviderErrorCode.AzureBlobProvider_ClearingData, "Clearing: GrainType={0} Grainid={1} ETag={2} BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
 
                 var blob = container.GetBlockBlobReference(blobName);
-                await blob.DeleteIfExistsAsync(
-                        DeleteSnapshotsOption.None,
-                        AccessCondition.GenerateIfMatchCondition(grainState.ETag),
-                        null,
-                        null).ConfigureAwait(false);
-                grainState.ETag = blob.Properties.ETag;
 
-                if (this.Log.IsVerbose3) this.Log.Verbose3((int)AzureProviderErrorCode.AzureBlobProvider_Cleared, "Cleared: GrainType={0} Grainid={1} ETag={2} BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blobName, container.Name);
+                await DoOptimisticUpdate(() => blob.DeleteIfExistsAsync(DeleteSnapshotsOption.None, AccessCondition.GenerateIfMatchCondition(grainState.ETag), null, null),
+                    blob, grainState.ETag).ConfigureAwait(false);
+
+                grainState.ETag = null;
+
+                if (this.Log.IsVerbose3) this.Log.Verbose3((int)AzureProviderErrorCode.AzureBlobProvider_Cleared, "Cleared: GrainType={0} Grainid={1} ETag={2} BlobName={3} in Container={4}", grainType, grainId, blob.Properties.ETag, blobName, container.Name);
             }
             catch (Exception ex)
             {
                 Log.Error((int)AzureProviderErrorCode.AzureBlobProvider_ClearError,
                   string.Format("Error clearing: GrainType={0} Grainid={1} ETag={2} BlobName={3} in Container={4} Exception={5}", grainType, grainId, grainState.ETag, blobName, container.Name, ex.Message),
                   ex);
+
+                throw;
+            }
+        }
+
+        private async Task WriteStateAndCreateContainerIfNotExists(string grainType, GrainReference grainId, IGrainState grainState, string json, CloudBlockBlob blob)
+        {
+            try
+            {
+                await DoOptimisticUpdate(() => blob.UploadTextAsync(json, Encoding.UTF8, AccessCondition.GenerateIfMatchCondition(grainState.ETag), null, null),
+                    blob, grainState.ETag).ConfigureAwait(false);
+
+                grainState.ETag = blob.Properties.ETag;
+            }
+            catch (StorageException exception) when (exception.IsContainerNotFound())
+            {
+                // if the container does not exist, create it, and make another attempt
+                if (this.Log.IsVerbose3) this.Log.Verbose3((int)AzureProviderErrorCode.AzureBlobProvider_ContainerNotFound, "Creating container: GrainType={0} Grainid={1} ETag={2} to BlobName={3} in Container={4}", grainType, grainId, grainState.ETag, blob.Name, container.Name);
+                await container.CreateIfNotExistsAsync().ConfigureAwait(false);
+
+                await WriteStateAndCreateContainerIfNotExists(grainType, grainId, grainState, json, blob).ConfigureAwait(false);
+            }
+        }
+
+        private static async Task DoOptimisticUpdate(Func<Task> updateOperation, CloudBlob blob, string currentETag)
+        {
+            try
+            {
+                await updateOperation.Invoke().ConfigureAwait(false);
+            }
+            catch (StorageException ex) when (ex.IsPreconditionFailed())
+            {
+                throw new InconsistentStateException($"Blob storage condition not Satisfied.  BlobName: {blob.Name}, Container: {blob.Container?.Name}, CurrentETag: {currentETag}", "Unkown", currentETag, ex);
             }
         }
     }

@@ -1,15 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
-using System.Reflection;
-using System.Text;
-using System.Xml;
 using System.Net;
 using System.Net.Sockets;
-using System.IO;
+using System.Reflection;
 using System.Runtime;
+using System.Text;
 using System.Threading.Tasks;
+using System.Xml;
 
 namespace Orleans.Runtime.Configuration
 {
@@ -18,6 +18,35 @@ namespace Orleans.Runtime.Configuration
     /// </summary>
     public static class ConfigUtilities
     {
+        internal static void ParseAdditionalAssemblyDirectories(IDictionary<string, SearchOption> directories, XmlElement root)
+        {
+            foreach (var node in root.ChildNodes)
+            {
+                var grandchild = node as XmlElement;
+
+                if (grandchild == null)
+                {
+                    continue;
+                }
+                else
+                {
+                    if (!grandchild.HasAttribute("Path"))
+                        throw new FormatException("Missing 'Path' attribute on Directory element.");
+
+                    // default to recursive
+                    var recursive = true;
+
+                    if (grandchild.HasAttribute("IncludeSubFolders"))
+                    {
+                        if (!bool.TryParse(grandchild.Attributes["IncludeSubFolders"].Value, out recursive))
+                            throw new FormatException("Attribute 'IncludeSubFolders' has invalid value.");
+
+                        directories[grandchild.Attributes["Path"].Value] = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+                    }
+                }
+            }
+        }
+
         internal static void ParseTelemetry(XmlElement root)
         {
             foreach (var node in root.ChildNodes)
@@ -44,17 +73,17 @@ namespace Orleans.Runtime.Configuration
                     try
                     {
                         assembly = Assembly.Load(assemblyName);
-                        
+
                         var pluginType = assembly.GetType(className);
                         if (pluginType == null) throw new TypeLoadException("Cannot locate plugin class " + className + " in assembly " + assembly.FullName);
 
                         var args = grandchild.Attributes.Cast<XmlAttribute>().Where(a => a.LocalName != "Type" && a.LocalName != "Assembly").ToArray();
 
                         var plugin = Activator.CreateInstance(pluginType, args);
-                        
+
                         if (plugin is ITelemetryConsumer)
                         {
-                            Logger.TelemetryConsumers.Add(plugin as ITelemetryConsumer);
+                            LogManager.TelemetryConsumers.Add(plugin as ITelemetryConsumer);
                         }
                         else
                         {
@@ -136,7 +165,7 @@ namespace Orleans.Runtime.Configuration
 
                         if (plugin is ILogConsumer)
                         {
-                            TraceLogger.LogConsumers.Add(plugin as ILogConsumer);
+                            LogManager.LogConsumers.Add(plugin as ILogConsumer);
                         }
                         else
                         {
@@ -276,9 +305,11 @@ namespace Orleans.Runtime.Configuration
                 case "0":
                     p = false;
                     break;
+
                 case "1":
                     p = true;
                     break;
+
                 default:
                     throw new FormatException(errorMessage + ". Tried to parse " + input);
             }
@@ -312,7 +343,7 @@ namespace Orleans.Runtime.Configuration
             {
                 returnValue = Type.GetType(input);
             }
-            catch(Exception e)
+            catch (Exception e)
             {
                 throw new FormatException(errorMessage, e);
             }
@@ -325,7 +356,7 @@ namespace Orleans.Runtime.Configuration
             return returnValue;
         }
 
-        internal static void ValidateSerializationProvider(Type type)
+        internal static void ValidateSerializationProvider(TypeInfo type)
         {
             if (type.IsClass == false)
             {
@@ -342,7 +373,7 @@ namespace Orleans.Runtime.Configuration
                 throw new FormatException(string.Format("The serialization provider type {0} is not public", type.FullName));
             }
 
-            if (type.IsGenericType && type.IsConstructedGenericType == false)
+            if (type.IsGenericType && type.IsConstructedGenericType() == false)
             {
                 throw new FormatException(string.Format("The serialization provider type {0} is generic and has a missing type parameter specification", type.FullName));
             }
@@ -362,45 +393,50 @@ namespace Orleans.Runtime.Configuration
         // Time spans are entered as a string of decimal digits, optionally followed by a unit string: "ms", "s", "m", "hr"
         internal static TimeSpan ParseTimeSpan(string input, string errorMessage)
         {
-            int unitSize;
+            long unitSize;
             string numberInput;
             var trimmedInput = input.Trim().ToLowerInvariant();
             if (trimmedInput.EndsWith("ms", StringComparison.Ordinal))
             {
-                unitSize = 1;
+                unitSize = 10000;
                 numberInput = trimmedInput.Remove(trimmedInput.Length - 2).Trim();
             }
             else if (trimmedInput.EndsWith("s", StringComparison.Ordinal))
             {
-                unitSize = 1000;
+                unitSize = 1000 * 10000;
                 numberInput = trimmedInput.Remove(trimmedInput.Length - 1).Trim();
             }
             else if (trimmedInput.EndsWith("m", StringComparison.Ordinal))
             {
-                unitSize = 60 * 1000;
+                unitSize = 60 * 1000 * 10000;
                 numberInput = trimmedInput.Remove(trimmedInput.Length - 1).Trim();
             }
             else if (trimmedInput.EndsWith("hr", StringComparison.Ordinal))
             {
-                unitSize = 60 * 60 * 1000;
+                unitSize = 60 * 60 * 1000 * 10000L;
                 numberInput = trimmedInput.Remove(trimmedInput.Length - 2).Trim();
             }
             else
             {
-                unitSize = 1000; // Default is seconds
+                unitSize = 1000 * 10000; // Default is seconds
                 numberInput = trimmedInput;
             }
-            double rawTimeSpan;
-            if (!double.TryParse(numberInput, out rawTimeSpan))
+            decimal rawTimeSpan;
+            if (!decimal.TryParse(numberInput, NumberStyles.Any, CultureInfo.InvariantCulture, out rawTimeSpan))
             {
                 throw new FormatException(errorMessage + ". Tried to parse " + input);
             }
-            return TimeSpan.FromMilliseconds(rawTimeSpan * unitSize);
+            return TimeSpan.FromTicks((long)(rawTimeSpan * unitSize));
+        }
+
+        internal static string ToParseableTimeSpan(TimeSpan input)
+        {
+            return $"{input.TotalMilliseconds.ToString(CultureInfo.InvariantCulture)}ms";
         }
 
         internal static byte[] ParseSubnet(string input, string errorMessage)
         {
-            return string.IsNullOrEmpty(input) ? null : input.Split('.').Select(s => (byte) ParseInt(s, errorMessage)).ToArray();
+            return string.IsNullOrEmpty(input) ? null : input.Split('.').Select(s => (byte)ParseInt(s, errorMessage)).ToArray();
         }
 
         internal static T ParseEnum<T>(string input, string errorMessage)
@@ -428,7 +464,7 @@ namespace Orleans.Runtime.Configuration
         {
             if (!root.HasAttribute("Address")) throw new FormatException("Missing Address attribute for " + root.LocalName + " element");
             if (!root.HasAttribute("Port")) throw new FormatException("Missing Port attribute for " + root.LocalName + " element");
-            
+
             var family = AddressFamily.InterNetwork;
             if (root.HasAttribute("Subnet"))
             {
@@ -487,8 +523,8 @@ namespace Orleans.Runtime.Configuration
         }
 
         /// <summary>
-        /// Prints the the DataConnectionString, 
-        /// without disclosing any credential info 
+        /// Prints the the DataConnectionString,
+        /// without disclosing any credential info
         /// such as the Azure Storage AccountKey or SqlServer password.
         /// </summary>
         /// <param name="dataConnectionString">The connection string to print.</param>
@@ -499,6 +535,8 @@ namespace Orleans.Runtime.Configuration
                 PrintDataConnectionInfo(dataConnectionString));
         }
 
+        /// <summary>Removes private credential information about an azure connection string by truncating the account key from it.</summary>
+        /// <param name="azureConnectionString">The original connection string</param>
         public static string PrintDataConnectionInfo(string azureConnectionString)
         {
             if (String.IsNullOrEmpty(azureConnectionString)) return "null";
@@ -513,6 +551,8 @@ namespace Orleans.Runtime.Configuration
             return azureConnectionInfo;
         }
 
+        /// <summary>Removes private credential information about a SQL connection string by truncating the account password from it.</summary>
+        /// <param name="sqlConnectionString">The original connection string</param>
         public static string PrintSqlConnectionString(string sqlConnectionString)
         {
             if (String.IsNullOrEmpty(sqlConnectionString))
@@ -562,7 +602,7 @@ namespace Orleans.Runtime.Configuration
                 {
                     var fileName = Path.GetFullPath(Path.Combine(dir, file));
                     if (File.Exists(fileName)) return fileName;
-                    
+
                     notFound.Add(fileName);
                 }
             }
@@ -585,22 +625,18 @@ namespace Orleans.Runtime.Configuration
         public static string RuntimeVersionInfo()
         {
             var sb = new StringBuilder();
+            sb.Append("   Orleans version: ").AppendLine(RuntimeVersion.Current);
+#if !NETSTANDARD_TODO
+            // TODO: could use Microsoft.Extensions.PlatformAbstractions package to get this info
             sb.Append("   .NET version: ").AppendLine(Environment.Version.ToString());
-            sb.Append("   Is .NET 4.5=").AppendLine(IsNet45OrNewer().ToString());
             sb.Append("   OS version: ").AppendLine(Environment.OSVersion.ToString());
+            sb.Append("   App config file: ").AppendLine(AppDomain.CurrentDomain.SetupInformation.ConfigurationFile);
+#endif
             sb.AppendFormat("   GC Type={0} GCLatencyMode={1}",
                               GCSettings.IsServerGC ? "Server" : "Client",
                               Enum.GetName(typeof(GCLatencyMode), GCSettings.LatencyMode))
                 .AppendLine();
             return sb.ToString();
-        }
-
-        internal static bool IsNet45OrNewer()
-        {
-            // From: http://stackoverflow.com/questions/8517159/how-to-detect-at-runtime-that-net-version-4-5-currently-running-your-code
-
-            // Class "ReflectionContext" exists from .NET 4.5 onwards.
-            return Type.GetType("System.Reflection.ReflectionContext", false) != null;
         }
     }
 }
